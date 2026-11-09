@@ -1,0 +1,821 @@
+---
+title: "PIA - TIA - Avance Descriptivo - Versión 1"
+subtitle: "Estadística Aplicada a Seguridad en TI"
+author: 
+  - " - Diego Francisco Martinez Reyes - [2118638]"
+  - " - Victor Adrian Rodriguez Ortiz - [1909518]"
+  - " - Ana Laura Palacios Salazar - [2115510]"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+
+# date: "2026-11-05"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+# Configuración global (Requisito Sección 5)
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5
+)
+# Verificación e instalación automática silenciosa de dependencias
+paquetes <- c("tidyverse", "knitr", "scales", "caret", "rpart", "randomForest", "pROC")
+paquetes_faltantes <- paquetes[!(paquetes %in% installed.packages()[, "Package"])]
+if (length(paquetes_faltantes) > 0) {
+  install.packages(paquetes_faltantes, repos = "https://cloud.r-project.org")
+}
+
+# Semilla aleatoria 
+set.seed(202611)
+```
+
+# 1. Preparación y Auditoría de Datos
+
+## 1.1 Entorno, Dependencias y Carga Reproducible
+
+Para garantizar la reproducibilidad del entorno, configuramos las dependencias sin usar rutas absolutas.
+
+```{r paquetes}
+library(tidyverse)
+library(knitr)
+```
+
+* **Versión de R utilizada:** `r R.version.string`
+* **Versión de `tidyverse`:** `r as.character(packageVersion("tidyverse"))`
+* **Versión de `knitr`:** `r as.character(packageVersion("knitr"))`
+
+Se carga el conjunto de datos `PhiUSIIL_Phishing_URL_Dataset.csv` directamente desde el directorio de trabajo o la carpeta de datos.
+
+```{r carga-datos}
+ruta_archivo <- "PhiUSIIL_Phishing_URL_Dataset.csv"
+
+# Búsqueda de archivo en directorio raíz o carpeta 'data'
+if (!file.exists(ruta_archivo)) {
+  ruta_archivo <- file.path("data", "PhiUSIIL_Phishing_URL_Dataset.csv")
+}
+
+datos_brutos <- read.csv(ruta_archivo, stringsAsFactors = FALSE)
+```
+
+
+## 1.2 Verificación de Estructura y Recodificación de Clase
+
+En el archivo original, la variable objetivo `label` codifica con `1` a los sitios legítimos y con `0` a los sitios de phishing. Para evaluar correctamente el desempeño de nuestro sistema (donde el evento a detectar es el ataque), recodificaremos la clase positiva como **Amenaza/Phishing = 1** y **Legítimo = 0**.
+
+```{r auditoria-calidad}
+# 1. Dimensiones iniciales, valores faltantes y duplicados
+n_obs_inicial <- nrow(datos_brutos)
+n_cols_inicial <- ncol(datos_brutos)
+total_faltantes <- sum(is.na(datos_brutos))
+duplicados_exactos <- sum(duplicated(datos_brutos))
+duplicados_url <- sum(duplicated(datos_brutos$URL))
+
+# 2. Limpieza de duplicados por unidad de análisis (URL) y recodificación
+# Se eliminan las URLs duplicadas para impedir fuga de información entre particiones
+datos_unicos <- datos_brutos %>%
+  distinct(URL, .keep_all = TRUE) %>%
+  mutate(
+    # Recodificación: Clase positiva de interés (Amenaza/Phishing) = 1, Legítimo = 0
+    phishing_num = ifelse(label == 0, 1L, 0L),
+    clase = factor(
+      ifelse(label == 0, "Phishing", "Legitimo"),
+      levels = c("Legitimo", "Phishing")
+    )
+  )
+
+n_obs_limpio <- nrow(datos_unicos)
+
+# Tabla resumen de estructura y calidad
+tabla_calidad <- tibble(
+  Indicador = c(
+    "Observaciones brutas en el archivo CSV",
+    "Variables totales en el archivo original",
+    "Total de valores faltantes (NA)",
+    "Filas idénticas duplicadas (incluyendo FILENAME)",
+    "URLs duplicadas detectadas y removidas",
+    "Observaciones únicas finales (unidades de análisis)",
+    "Sitios Legítimos (clase = 0 tras recodificar)",
+    "Sitios de Phishing / Amenaza (clase = 1 tras recodificar)"
+  ),
+  Valor = c(
+    format(n_obs_inicial, big.mark = ","),
+    as.character(n_cols_inicial),
+    as.character(total_faltantes),
+    as.character(duplicados_exactos),
+    as.character(duplicados_url),
+    format(n_obs_limpio, big.mark = ","),
+    paste0(format(sum(datos_unicos$phishing_num == 0), big.mark = ","),
+           " (", round(mean(datos_unicos$phishing_num == 0) * 100, 2), "%)"),
+    paste0(format(sum(datos_unicos$phishing_num == 1), big.mark = ","),
+           " (", round(mean(datos_unicos$phishing_num == 1) * 100, 2), "%)")
+  )
+)
+
+kable(
+  tabla_calidad,
+  caption = "Tabla 1. Resumen de dimensiones, limpieza y distribución de clases."
+)
+```
+
+## 1.3 Tipología de Variables y Fuga de Información (*Data Leakage*)
+
+En esta sección identificamos el tipo de variables predictoras y evaluamos un riesgo importante: la separación cuasi-completa. Si una variable tiene varianza cero dentro de una de las clases, su inclusión directa en algoritmos de aprendizaje o regresiones puede provocar predicciones artificiales sesgadas.
+
+```{r auditoria-variables}
+# Identificación de tipos de variables predictoras
+vars_texto_id <- c("FILENAME", "URL", "Domain", "TLD", "Title")
+vars_predictoras_num <- setdiff(
+  names(datos_brutos),
+  c(vars_texto_id, "label")
+)
+
+es_binaria <- sapply(datos_unicos[vars_predictoras_num], function(x) {
+  all(unique(x) %in% c(0, 1))
+})
+
+vars_binarias <- vars_predictoras_num[es_binaria]
+vars_cuantitativas <- vars_predictoras_num[!es_binaria]
+
+# Tabla de clasificación funcional de variables (Requisito Sección 3.1)
+resumen_tipos <- tibble(
+  Categoria = c(
+    "Identificadoras y texto libre (excluidas de modelación)",
+    "Predictoras binarias / indicadoras (0 o 1)",
+    "Predictoras cuantitativas (conteos, longitudes y tasas)",
+    "Variable de respuesta recodificada"
+  ),
+  Cantidad = c(
+    length(vars_texto_id),
+    length(vars_binarias),
+    length(vars_cuantitativas),
+    1
+  ),
+  Ejemplos = c(
+    paste(vars_texto_id, collapse = ", "),
+    paste(head(vars_binarias, 5), collapse = ", "),
+    paste(head(vars_cuantitativas, 5), collapse = ", "),
+    "phishing_num (1 = Phishing, 0 = Legítimo) / factor clase"
+  )
+)
+
+kable(
+  resumen_tipos,
+  caption = "Tabla 2. Clasificación funcional de las 56 variables del dataset."
+)
+
+# Auditoría de variables con varianza cero
+auditoria_separabilidad <- datos_unicos %>%
+  select(all_of(vars_predictoras_num), clase) %>%
+  pivot_longer(cols = -clase, names_to = "Variable", values_to = "Valor") %>%
+  group_by(Variable, clase) %>%
+  summarise(
+    Media = mean(Valor),
+    DE = sd(Valor),
+    Min = min(Valor),
+    Max = max(Valor),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = clase,
+    values_from = c(Media, DE, Min, Max)
+  ) %>%
+  filter(DE_Legitimo == 0 | DE_Phishing == 0) %>%
+  select(
+    Variable,
+    Media_Legitimo, DE_Legitimo,
+    Media_Phishing, DE_Phishing
+  )
+
+kable(
+  auditoria_separabilidad,
+  digits = 4,
+  caption = "Tabla 3. Variables con desviación estándar igual a cero en la clase Legítima (Alerta de separación perfecta)."
+)
+```
+
+**Comentario sobre calidad y sesgo:** Destaca el caso de `URLSimilarityIndex`, donde el $100\%$ de los sitios legítimos presentan un valor constante de $100$. De igual forma, ciertas variables asociadas a la URL (ej. `IsHTTPS`, presencia de interrogaciones o ampersands) tienen varianza cero en los dominios legítimos. Esto va derivado de comparar sitios legítimos recolectados en su dominio raíz frente a sitios de phishing obtenidos con rutas profundas completas. Estas variables deberán ser excluidas o tratadas con cuidado en la etapa de modelación para evitar falsos positivos.
+
+## 1.4 Dataset Final para Análisis
+
+Retiramos las variables identificadoras (texto libre) y la etiqueta original para dejar un entorno de datos estructurado.
+
+```{r dataset-limpio}
+# Se excluyen identificadores de texto libre y la etiqueta original 'label'
+vars_varianza_cero_legit <- auditoria_separabilidad$Variable
+
+datos_limpios <- datos_unicos %>%
+  select(-FILENAME, -URL, -Domain, -Title, -label)
+
+cat("El conjunto 'datos_limpios' queda estructurado con",
+    nrow(datos_limpios), "observaciones y", ncol(datos_limpios), "columnas.\n")
+```
+
+# 2. Análisis Univariado y Diccionario
+
+*(Se usa el objeto `datos_limpios`, `vars_cuantitativas` y `vars_binarias`)*
+
+## 2.1 Diccionario de Variables
+
+```{r diccionario-53-variables, echo=TRUE, message=FALSE, warning=FALSE}
+library(knitr)
+library(dplyr)
+
+# Verificar la existencia de datos_limpios
+if (!exists("datos_limpios")) {
+  stop("El objeto 'datos_limpios' no se encuentra cargado en el entorno.")
+}
+
+# Generación dinámica del diccionario sobre las 53 variables del dataset: datos_limpios
+diccionario_53 <- data.frame(
+  Variable = names(datos_limpios),
+  Tipo_Dato_R = sapply(datos_limpios, class),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    Tipo_Dato = case_when(
+      Variable %in% c("URL", "Domain", "TLD", "FILENAME", "Title") ~ "Texto",
+      Variable %in% c("label", "clase") ~ "Categoría",
+      Tipo_Dato_R %in% c("numeric") ~ "Número continuo",
+      Tipo_Dato_R %in% c("integer") & grepl("Is|Has|Bank|Pay|Crypto", Variable) ~ "Booleano",
+      Tipo_Dato_R %in% c("integer") ~ "Número entero",
+      Tipo_Dato_R %in% c("factor", "logical") ~ "Booleano",
+      TRUE ~ "Otro"
+    ),
+    Tipo_Estadistico = case_when(
+      Tipo_Dato %in% c("Texto", "Categoría", "Booleano") ~ "Cualitativa Nominal",
+      Tipo_Dato == "Número entero" ~ "Cuantitativa Discreta",
+      Tipo_Dato == "Número continuo" ~ "Cuantitativa Continua",
+      TRUE ~ "Cualitativa Nominal"
+    ),
+    Descripcion = case_when(
+      # Meta e Identificadores
+      Variable == "URL" ~ "Dirección URL completa analizada",
+      Variable == "Domain" ~ "Nombre del dominio principal tomado de la URL",
+      Variable == "TLD" ~ "Dominio de nivel superior",
+      Variable %in% c("label", "clase") ~ "Variable de clasificación (0 = Legítimo, 1 = Phishing)",
+      
+      # Conteos y Longitudes (Discretas)
+      Variable == "URLLength" ~ "Longitud total de caracteres de la URL",
+      Variable == "DomainLength" ~ "Longitud de caracteres del nombre de dominio",
+      Variable == "TLDLength" ~ "Longitud de la extensión TLD",
+      Variable == "NoOfSubDomain" ~ "Cantidad de subdominios presentes en la URL",
+      Variable == "NoOfLettersInURL" ~ "Cantidad de letras en la URL",
+      Variable == "NoOfDegitsInURL" ~ "Cantidad de dígitos en la URL",
+      Variable == "NoOfEqualsInURL" ~ "Conteo del carácter '=' en la URL",
+      Variable == "NoOfQMarkInURL" ~ "Conteo del carácter '?' en la URL",
+      Variable == "NoOfAmpersandInURL" ~ "Conteo del carácter '&' en la URL",
+      Variable == "NoOfOtherSpecialCharsInURL" ~ "Cantidad de otros caracteres especiales en la URL",
+      Variable == "NoOfObfuscatedChar" ~ "Cantidad de caracteres con codificación u ofuscación",
+      Variable == "LineOfCode" ~ "Cantidad de líneas de código fuente HTML",
+      Variable == "LargestLineLength" ~ "Longitud de caracteres de la línea HTML más larga",
+      Variable == "NoOfURLRedirect" ~ "Número de redirecciones de la URL",
+      Variable == "NoOfSelfRedirect" ~ "Número de redirecciones dentro del mismo dominio",
+      Variable == "NoOfPopup" ~ "Cantidad de ventanas emergentes (pop-ups) detectadas",
+      Variable == "NoOfiFrame" ~ "Cantidad de marcos iFrame incrustados",
+      Variable == "NoOfImage" ~ "Número de imágenes presentes en el documento HTML",
+      Variable == "NoOfCSS" ~ "Número de archivos de hojas de estilo CSS enlazados",
+      Variable == "NoOfJS" ~ "Número de archivos de código JavaScript enlazados",
+      Variable == "NoOfSelfRef" ~ "Conteo de secciones/recursos con autorreferencia",
+      Variable == "NoOfEmptyRef" ~ "Conteo de referencias o enlaces vacíos (href='#')",
+      Variable == "NoOfExternalRef" ~ "Conteo de enlaces apuntando a dominios externos",
+      
+      # Probabilidades y Ratios (Continuas)
+      Variable == "URLSimilarityIndex" ~ "Índice sintáctico de similitud con dominios legítimos",
+      Variable == "CharContinuationRate" ~ "Tasa de continuidad de caracteres consecutivos",
+      Variable == "TLDLegitimateProb" ~ "Probabilidad del TLD según legitimidad histórica",
+      Variable == "URLCharProb" ~ "Probabilidad de distribución de caracteres en la URL",
+      Variable == "ObfuscationRatio" ~ "Proporción de caracteres ofuscados respecto al total",
+      Variable == "LetterRatioInURL" ~ "Proporción de letras respecto a la longitud de la URL",
+      Variable == "DegitRatioInURL" ~ "Proporción de números respecto a la longitud de la URL",
+      Variable == "EqualsRatioInURL" ~ "Proporción del carácter '=' en la URL",
+      Variable == "QMarkRatioInURL" ~ "Proporción del carácter '?' en la URL",
+      Variable == "AmpersandRatioInURL" ~ "Proporción del carácter '&' en la URL",
+      Variable == "SpacialCharRatioInURL" ~ "Proporción de caracteres especiales en la URL",
+      Variable == "TLDLengthRatio" ~ "Proporción entre la longitud del TLD y el dominio",
+      Variable == "DomainTitleMatchScore" ~ "Puntaje de coincidencia entre dominio y título HTML",
+      Variable == "URLTitleMatchScore" ~ "Puntaje de coincidencia entre URL completa y título HTML",
+      
+      # Banderas Binarias (Booleanas)
+      Variable == "IsDomainIP" ~ "Indicador si el dominio es una IP (1) o no (0)",
+      Variable == "IsHTTPS" ~ "Indicador de uso de protocolo seguro HTTPS (1) o no (0)",
+      Variable == "HasObfuscation" ~ "Presencia de técnicas de ofuscación (1) o no (0)",
+      Variable == "HasTitle" ~ "Presencia de etiqueta de título HTML",
+      Variable == "HasFavicon" ~ "Presencia de icono Favicon en la página",
+      Variable == "IsResponsive" ~ "Indicador de formato web responsivo",
+      Variable == "HasDescription" ~ "Presencia de etiqueta meta de descripción",
+      Variable == "HasExternalFormSubmit" ~ "Formulario que envía datos a dominio externo",
+      Variable == "HasSocialNet" ~ "Presencia de enlaces a redes sociales",
+      Variable == "HasSubmitButton" ~ "Presencia de botón de envío en formularios",
+      Variable == "HasHiddenFields" ~ "Presencia de campos ocultos en formularios",
+      Variable == "HasPasswordField" ~ "Presencia de campo para entrada de contraseña",
+      Variable == "Bank" ~ "Indicador de referencias/palabras clave bancarias",
+      Variable == "Pay" ~ "Indicador de palabras clave de plataformas de pago",
+      Variable == "Crypto" ~ "Indicador de referencias a criptomonedas o billeteras",
+      
+      TRUE ~ "Métrica de análisis estructurado del sitio web"
+    )
+  )
+
+# Despliegue formal del diccionario para las 53 variables reales
+knitr::kable(
+  diccionario_53 %>% select(Variable, Tipo_Dato, Tipo_Estadistico, Descripcion), 
+  col.names = c("Variable", "Tipo de Dato", "Tipo Estadístico", "Descripción"),
+  row.names = FALSE,
+  caption = "Tabla 4. Diccionario completo de las 53 variables resultantes del dataset: datos_limpios"
+)
+# la tabla 1 se renombró a tabla 4
+```
+## 2.2 Medidas de Centro y Dispersión
+
+```{r medidas-descriptivas, echo=TRUE, message=FALSE, warning=FALSE}
+library(knitr)
+library(dplyr)
+
+# Función para calcular medidas de centro, dispersión y cuantiles sobre datos_limpios
+calcular_medidas <- function(df, variable) {
+  x <- df[[variable]]
+  x <- x[!is.na(x)] # Remover valores NAs
+  
+  data.frame(
+    Variable           = variable,
+    Media              = round(mean(x), 4),
+    Mediana            = round(median(x), 4),
+    Desv_Estandar      = round(sd(x), 4),
+    Varianza           = round(var(x), 4),
+    Rango_Intercuartil = round(IQR(x), 4),
+    Rango_Total        = round(diff(range(x)), 4),
+    Q1_p25             = round(quantile(x, 0.25), 4),
+    Q2_p50             = round(quantile(x, 0.50), 4),
+    Q3_p75             = round(quantile(x, 0.75), 4),
+    Percentil_90       = round(quantile(x, 0.90), 4)
+  )
+}
+
+# Selección de las variables numéricas más representativas presentes en vars_cuantitativas
+vars_analisis <- intersect(
+  c("URLSimilarityIndex", "URLLength", "CharContinuationRate", "TLDLegitimateProb", "URLCharProb", "NoOfObfuscatedChar"),
+  vars_cuantitativas
+)
+
+# Generar tabla consolidada sobre datos_limpios
+tabla_medidas_resumen <- do.call(rbind, lapply(vars_analisis, function(v) calcular_medidas(datos_limpios, v)))
+
+# Renderizado de la Tabla 5 (antes 2)
+kable(
+  tabla_medidas_resumen, 
+  col.names = c("Variable", "Media", "Mediana", "Desviación Estándar", "Varianza", "IQR", "Rango", "Q1 (p25)", "Q2 (p50)", "Q3 (p75)", "P90"),
+  row.names = FALSE,
+  caption = "Tabla 5. Medidas de tendencia central, dispersión y cuantiles sobre el dataset datos_limpios"
+)
+```
+
+## 2.3 Visualizaciones Univariadas y Distribución de Clases
+
+Para entender la estructura y comportamiento de los datos, se diseñaron tres gráficas univariadas enfocadas en la similitud de URLs legitimas y maliciosas, la longitud de las URL y la proporción entre los tipos de sitio analizados.
+
+---
+
+### Figura 1. Distribución de Similitud de URL
+
+**Descripción de la gráfica:** 
+Esta visualización combina un histograma con una curva de densidad para mostrar cómo se distribuyen los valores del índice de similitud (`URLSimilarityIndex`) en las URLs evaluadas. Permite identificar si los datos se concentran en un rango específico o si se reparten a lo largo de toda la gráfica.
+
+```{r grafica-1, echo=TRUE, message=FALSE, warning=FALSE, fig.width=8, fig.height=4}
+library(ggplot2)
+
+ggplot(datos_limpios, aes(x = URLSimilarityIndex)) +
+  geom_histogram(aes(y = ..density..), bins = 35, fill = "#2b5c8f", color = "white", alpha = 0.75) +
+  geom_density(color = "#e74c3c", size = 1) +
+  labs(
+    title = "Distribución de Similitud de URL",
+    subtitle = "Índice de similitud del dominio",
+    x = "Similitud de URL (URLSimilarityIndex)",
+    y = "Densidad"
+  ) +
+  theme_minimal()
+```
+
+**Explicación:**
+La gran mayoría de los registros se concentran cerca del valor 100, lo que indica que una proporción alta de los dominios en la muestra tienen un formato que imita o coincide con dominios web legítimos. Por otro lado, la línea roja que baja hacia la izquierda muestra que existe pocos sitios con índices de similitud bajos, que es la franja donde suelen ubicarse algunas variaciones de phishing.
+
+---
+
+### Figura 2. Longitud de las URLs
+
+**Descripción de la gráfica:** 
+Es un diagrama de caja (*boxplot*) graficado en escala logarítmica que evalúa la variable `URLLength`. Representa visualmente el punto central de los datos (la mediana), la extensión de la mitad de los registros (rango intercuartílico) y la presencia de valores que están fuera de lo común.
+
+```{r grafica-2, echo=TRUE, message=FALSE, warning=FALSE, fig.width=8, fig.height=4}
+ggplot(datos_limpios, aes(y = URLLength)) +
+  geom_boxplot(fill = "#27ae60", alpha = 0.6, outlier.color = "#c0392b", outlier.size = 0.8) +
+  scale_y_log10() +
+  labs(
+    title = "Longitud de las URLs",
+    subtitle = "Mediana, dispersión y valores atípicos",
+    y = "Caracteres en la URL (Escala Log)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_blank())
+```
+
+**Explicación:**
+El rectangulo verde de la parte inferior demuestra que la mayoría de las URLs analizadas tienen una longitud estándar. Sin embargo, la acumulación de puntos rojos hacia arriba evidencia una gran cantidad de valores atípicos. En ciberseguridad, estas URLs con longitudes muy altas suelen significar enlaces maliciosos diseñados para esconder la verdadera dirección destino mediante múltiples parámetros y subdominios pegados.
+
+---
+
+### Figura 3. Cantidad de Sitios por Tipo
+
+**Descripción de la gráfica:** 
+Es un gráfico de barras que cuenta los registros de la variable respuesta (`clase` o `label`), mostrando tanto la cantidad total de URLs como el porcentaje que representa cada categoría dentro de la base de datos.
+
+```{r grafica-3, echo=TRUE, message=FALSE, warning=FALSE, fig.width=8, fig.height=4}
+library(dplyr)
+library(scales)
+
+var_objetivo <- if("clase" %in% names(datos_limpios)) "clase" else "label"
+
+df_clases <- datos_limpios %>%
+  count(.data[[var_objetivo]]) %>%
+  rename(Target = 1) %>%
+  mutate(
+    Clase = if_else(as.character(Target) %in% c("1", "Phishing"), "Phishing", "Legítimo"),
+    Proporcion = n / sum(n),
+    Porcentaje = paste0(round(Proporcion * 100, 2), "%")
+  )
+
+ggplot(df_clases, aes(x = Clase, y = n, fill = Clase)) +
+  geom_bar(stat = "identity", alpha = 0.85, width = 0.45) +
+  geom_text(aes(label = paste0(format(n, big.mark = ","), "\n(", Porcentaje, ")")), 
+            vjust = -0.3, fontface = "bold", size = 3.8) +
+  scale_fill_manual(values = c("Legítimo" = "#2ecc71", "Phishing" = "#e74c3c")) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.18))) +
+  labs(
+    title = "Cantidad de Sitios por Tipo",
+    subtitle = "Comparación entre sitios Legítimos y de Phishing",
+    x = "Tipo de Sitio",
+    y = "Cantidad de Registros"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+**Explicación:**
+De las 235,370 observaciones totales en el dataset limpio, 134,850 registros corresponden a páginas **Legítimas** (57.29%) y 100,520 corresponden a sitios de **Phishing** (42.71%). Al mantener una proporción relativamente balanceada entre ambas clases, los datos quedan listos para análisis posteriores.
+
+# 3. Análisis Bivariado y Correlaciones
+
+*(Predictores contra la variable objetivo `clase`)*
+
+## 3.1 Visualizaciones Comparativas
+
+Para analizar cómo discriminan las variables predictoras entre sitios **Legítimos** y de **Phishing**, se comparan tanto variables cuantitativas (tasas y estructura del código HTML) como variables indicadoras binarias.
+
+```{r graficas, echo=TRUE, message=FALSE, warning=FALSE, fig.width=9, fig.height=4.5}
+# Figura 4: Comparación de predictoras cuantitativas por clase (Boxplots)
+datos_biv_num <- datos_limpios %>%
+  select(clase, SpacialCharRatioInURL, URLCharProb, LineOfCode, DomainTitleMatchScore) %>%
+  mutate(LineOfCode_Log10 = log10(LineOfCode + 1)) %>%
+  select(-LineOfCode) %>%
+  pivot_longer(cols = -clase, names_to = "Variable", values_to = "Valor")
+
+ggplot(datos_biv_num, aes(x = clase, y = Valor, fill = clase)) +
+  geom_boxplot(alpha = 0.75, outlier.size = 0.5, outlier.alpha = 0.3) +
+  facet_wrap(~ Variable, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = c("Legitimo" = "#2ecc71", "Phishing" = "#e74c3c")) +
+  labs(
+    title = "Figura 4. Distribución de variables cuantitativas clave según Clase",
+    subtitle = "Comparación entre sitios Legítimos y de Phishing",
+    x = "Clase del Sitio",
+    y = "Valor observacional"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none", strip.text = element_text(face = "bold"))
+
+# Figura 5: Proporción de características estructurales (binarias) por clase
+datos_biv_bin <- datos_limpios %>%
+  select(clase, HasSocialNet, HasCopyrightInfo, HasDescription, HasSubmitButton, HasHiddenFields, HasPasswordField) %>%
+  pivot_longer(cols = -clase, names_to = "Caracteristica", values_to = "Presente") %>%
+  group_by(clase, Caracteristica) %>%
+  summarise(Porcentaje = mean(Presente) * 100, .groups = "drop")
+
+ggplot(datos_biv_bin, aes(x = reorder(Caracteristica, Porcentaje), y = Porcentaje, fill = clase)) +
+  geom_col(position = "dodge", alpha = 0.85, width = 0.7) +
+  coord_flip() +
+  scale_fill_manual(values = c("Legitimo" = "#2ecc71", "Phishing" = "#e74c3c")) +
+  labs(
+    title = "Figura 5. Presencia de elementos HTML y formularios según Clase (%)",
+    subtitle = "Comparación porcentual de banderas binarias entre sitios Legítimos y Phishing",
+    x = "Variable Indicadora",
+    y = "Porcentaje de Sitios con la Característica (%)",
+    fill = "Clase"
+  ) +
+  theme_minimal()
+```
+
+**Interpretación del análisis bivariado:**
+* **Proporción de caracteres especiales (`SpacialCharRatioInURL`):** Los sitios de *phishing* presentan una media ($0.0832$, mediana $0.0800$) casi del doble que los sitios legítimos ($0.0484$, mediana $0.0420$), debido al uso de guiones, símbolos y subrutas para simular dominios oficiales.
+* **Complejidad del código (`LineOfCode`):** Los sitios legítimos tienen una mediana de $1,105$ líneas de código HTML frente a apenas $12$ líneas en sitios de *phishing*, confirmando que las páginas maliciosas suelen ser plantillas ligeras de captura rápida.
+* **Indicadores estructurales (Figura 5):** Los sitios legítimos incluyen con mucha mayor frecuencia enlaces a redes sociales (`HasSocialNet`: $79.46\%$ vs. $0.51\%$), avisos de derechos de autor (`HasCopyrightInfo`: $80.82\%$ vs. $5.72\%$) y metadatos de descripción (`HasDescription`: $73.66\%$ vs. $4.41\%$).
+
+---
+
+## 3.2 Matriz de Correlaciones
+
+Se calcula la matriz de correlación de Pearson entre las variables numéricas (excluyendo aquellas con varianza cero detectadas en la Sección 1.3) respecto a la variable objetivo recodificada `phishing_num` ($1 = \text{Phishing}, 0 = \text{Legítimo}$).
+
+```{r correlaciones, echo=TRUE, message=FALSE, warning=FALSE, fig.width=8, fig.height=6}
+# Seleccionar predictoras válidas (sin varianza cero) y calcular correlación con phishing_num
+vars_validas_corr <- setdiff(
+  names(datos_limpios),
+  c("TLD", "clase", vars_varianza_cero_legit)
+)
+
+cor_con_objetivo <- cor(
+  datos_limpios[, setdiff(vars_validas_corr, "phishing_num")],
+  datos_limpios$phishing_num,
+  use = "complete.obs"
+)
+
+# Extraer el Top 12 de variables con mayor correlación absoluta
+top_12_vars <- head(rownames(cor_con_objetivo)[order(abs(cor_con_objetivo[, 1]), decreasing = TRUE)], 12)
+
+tabla_top_corr <- tibble(
+  Variable = top_12_vars,
+  Correlacion_Pearson = round(cor_con_objetivo[top_12_vars, 1], 4),
+  Relacion_con_Phishing = ifelse(
+    cor_con_objetivo[top_12_vars, 1] > 0,
+    "Positiva (Asociada a mayor presencia de Phishing)",
+    "Negativa (Asociada a Sitios Legítimos)"
+  )
+)
+
+kable(
+  tabla_top_corr,
+  col.names = c("Variable Predictora", "Correlación (r)", "Dirección del Efecto"),
+  caption = "Tabla 6. Top 12 variables con mayor correlación absoluta respecto a Phishing (excluyendo variables con fuga de datos)."
+)
+
+# Mapa de calor (Heatmap) de la matriz de correlaciones del Top 12 + phishing_num
+matriz_corr <- cor(datos_limpios[, c("phishing_num", top_12_vars)], use = "complete.obs")
+
+matriz_larga <- as.data.frame(as.table(matriz_corr)) %>%
+  rename(Var1 = 1, Var2 = 2, Correlacion = 3)
+
+ggplot(matriz_larga, aes(x = Var1, y = Var2, fill = Correlacion)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(Correlacion, 2)), size = 2.8, color = "black") +
+  scale_fill_gradient2(low = "#2b5c8f", mid = "white", high = "#e74c3c", midpoint = 0, limit = c(-1, 1)) +
+  labs(
+    title = "Figura 6. Mapa de Calor de Correlaciones (Top 12 Predictoras y Phishing)",
+    x = "",
+    y = "",
+    fill = "Pearson (r)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+**Interpretación de correlaciones y multicolinealidad:**
+Las correlaciones más fuertes con `phishing_num` son negativas: `HasSocialNet` ($r = -0.7839$), `HasCopyrightInfo` ($r = -0.7432$) y `HasDescription` ($r = -0.6900$). Por el lado positivo destacan `SpacialCharRatioInURL` ($r = 0.5330$) y `DegitRatioInURL` ($r = 0.4319$). Además, el mapa de calor permite observar colinealidad moderada entre `DomainTitleMatchScore` y `URLTitleMatchScore`, aspecto relevante a vigilar en el Modelo 1 (Regresión Logística).
+
+
+
+# 4. Partición Estratificada e Inferencia Estadística
+
+## 4.1 Partición Estratificada de Datos
+
+Para evitar cualquier fuga de información (*data leakage*) o sesgo de evaluación, se ejecuta una partición aleatoria estratificada respecto a la variable respuesta `clase` fijando explícitamente la semilla aleatoria del proyecto (`set.seed(202611)`). Todos los ajustes de preprocesamiento, selección de variables, validación cruzada e hiperparámetros en las secciones posteriores se aprenderán exclusivamente sobre `datos_entrenamiento`.
+
+```{r particion-estratificada, echo=TRUE, message=FALSE, warning=FALSE}
+library(caret)
+
+# Semilla aleatoria
+set.seed(202611)
+
+# Índices para partición estratificada: 75% entrenamiento y 25% prueba
+indices_entrenamiento <- createDataPartition(
+  y = datos_limpios$clase,
+  p = 0.75,
+  list = FALSE
+)
+
+datos_entrenamiento <- datos_limpios[indices_entrenamiento, ]
+datos_prueba        <- datos_limpios[-indices_entrenamiento, ]
+
+# Tabla de verificación de la estratificación
+tabla_particion <- tibble(
+  Conjunto = c("Conjunto de Entrenamiento (75%)", "Conjunto de Prueba (25%)", "Total Único (datos_limpios)"),
+  Observaciones_Totales = c(
+    format(nrow(datos_entrenamiento), big.mark = ","),
+    format(nrow(datos_prueba), big.mark = ","),
+    format(nrow(datos_limpios), big.mark = ",")
+  ),
+  Sitios_Legitimos = c(
+    paste0(format(sum(datos_entrenamiento$phishing_num == 0), big.mark = ","),
+           " (", round(mean(datos_entrenamiento$phishing_num == 0) * 100, 2), "%)"),
+    paste0(format(sum(datos_prueba$phishing_num == 0), big.mark = ","),
+           " (", round(mean(datos_prueba$phishing_num == 0) * 100, 2), "%)"),
+    paste0(format(sum(datos_limpios$phishing_num == 0), big.mark = ","),
+           " (", round(mean(datos_limpios$phishing_num == 0) * 100, 2), "%)")
+  ),
+  Sitios_Phishing_Amenaza = c(
+    paste0(format(sum(datos_entrenamiento$phishing_num == 1), big.mark = ","),
+           " (", round(mean(datos_entrenamiento$phishing_num == 1) * 100, 2), "%)"),
+    paste0(format(sum(datos_prueba$phishing_num == 1), big.mark = ","),
+           " (", round(mean(datos_prueba$phishing_num == 1) * 100, 2), "%)"),
+    paste0(format(sum(datos_limpios$phishing_num == 1), big.mark = ","),
+           " (", round(mean(datos_limpios$phishing_num == 1) * 100, 2), "%)")
+  )
+)
+
+kable(
+  tabla_particion,
+  col.names = c("Subconjunto", "Total de URLs", "Legítimos (clase = 0)", "Phishing / Amenaza (clase = 1)"),
+  caption = "Tabla 7. Verificación de la partición estratificada (75% Entrenamiento / 25% Prueba) con semilla 202611."
+)
+
+```
+
+---
+
+## 4.2 Análisis Inferencial 1: Estimación de Prevalencia y Comparación de Dos Proporciones
+
+### Parte A: Intervalo de Confianza al 95% para la Prevalencia Poblacional de Phishing
+
+* **Pregunta:** ¿Cuál es la prevalencia de sitios de phishing en la población representada por la muestra y qué incertidumbre tiene esa estimación?
+* **Parámetro de interés:** $p$, proporción verdadera de sitios de phishing en la población.
+* **Nivel de significancia y confianza:** $\alpha = 0.05$ (Nivel de confianza $1 - \alpha = 95\%$, valor crítico $Z_{\alpha/2} = 1.96$).
+* **Supuestos:** Muestra de unidades de análisis independientes ($n = 235,370$) y normalidad asintótica garantizada por el Teorema del Límite Central al cumplirse $x = np = 100,520 \ge 5$ y $n - x = n(1-p) = 134,850 \ge 5$.
+
+### Parte B: Prueba de Hipótesis para la Diferencia de Dos Proporciones (`HasHiddenFields`)
+
+* **Pregunta:** ¿Existe una diferencia estadísticamente significativa y operativamente relevante en la proporción de sitios que emplean campos ocultos (`HasHiddenFields = 1`) entre las clases Phishing y Legítimo?
+* **Parámetro e Hipótesis:** Sea $\theta = p_1 - p_2$, donde $p_1$ es la proporción de sitios con campos ocultos en la población de Phishing y $p_2$ en la población de sitios Legítimos. Con $\alpha = 0.05$:
+
+$$H_0: p_1 - p_2 = 0 \quad (p_1 = p_2) \qquad \text{vs.} \qquad H_1: p_1 - p_2 \neq 0 \quad (p_1 \neq p_2)$$
+
+
+* **Supuestos:** Dos muestras independientes ($n_1 = 100,520$ y $n_2 = 134,850$) con conteos de éxitos y fracasos mayores a $5$ en ambos grupos ($x_1 = 9,352$, $n_1 - x_1 = 91,168$, $x_2 = 79,667$, $n_2 - x_2 = 55,183$).
+
+```{r inferencia-1-proporciones, echo=TRUE, message=FALSE, warning=FALSE}
+# --- 1A. Intervalo de Confianza al 95% para la Prevalencia de Phishing ---
+n_total  <- nrow(datos_limpios)
+x_phish  <- sum(datos_limpios$phishing_num == 1)
+p_gorro  <- x_phish / n_total
+z_crit   <- qnorm(0.975)
+se_prev  <- sqrt(p_gorro * (1 - p_gorro) / n_total)
+ic_wald  <- c(p_gorro - z_crit * se_prev, p_gorro + z_crit * se_prev)
+
+# Verificación con prop.test (intervalo de Wilson sin corrección de continuidad)
+prueba_prev <- prop.test(x = x_phish, n = n_total, conf.level = 0.95, correct = FALSE)
+
+# --- 1B. Comparación de Dos Proporciones: HasHiddenFields entre Phishing (1) y Legítimo (0) ---
+x1_ocultos <- sum(datos_limpios$HasHiddenFields[datos_limpios$phishing_num == 1] == 1)
+n1_phish   <- sum(datos_limpios$phishing_num == 1)
+
+x2_ocultos <- sum(datos_limpios$HasHiddenFields[datos_limpios$phishing_num == 0] == 1)
+n2_legit   <- sum(datos_limpios$phishing_num == 0)
+
+p1_gorro <- x1_ocultos / n1_phish
+p2_gorro <- x2_ocultos / n2_legit
+dif_prop <- p1_gorro - p2_gorro
+
+# Estadístico Z agrupado bajo H0
+p_agrupada <- (x1_ocultos + x2_ocultos) / (n1_phish + n2_legit)
+se_agrupado <- sqrt(p_agrupada * (1 - p_agrupada) * (1 / n1_phish + 1 / n2_legit))
+z_dos_prop  <- dif_prop / se_agrupado
+
+# Prueba formal en R
+prueba_2prop <- prop.test(
+  x = c(x1_ocultos, x2_ocultos),
+  n = c(n1_phish, n2_legit),
+  alternative = "two.sided",
+  conf.level = 0.95,
+  correct = FALSE
+)
+
+tabla_inferencia_1 <- tibble(
+  Analisis = c(
+    "1A. IC 95% Prevalencia de Phishing (p)",
+    "1B. Diferencia de Proporciones HasHiddenFields (p1 - p2)"
+  ),
+  Estimacion_Puntual = c(
+    paste0(round(p_gorro * 100, 2), "% (p_hat = ", round(p_gorro, 4), ")"),
+    paste0(round(dif_prop * 100, 2), "% (Phish: ", round(p1_gorro * 100, 2),
+           "% vs. Legit: ", round(p2_gorro * 100, 2), "%)")
+  ),
+  Intervalo_Confianza_95 = c(
+    paste0("[", round(ic_wald[1] * 100, 2), "%, ", round(ic_wald[2] * 100, 2), "%]"),
+    paste0("[", round(prueba_2prop$conf.int[1] * 100, 2), "%, ",
+           round(prueba_2prop$conf.int[2] * 100, 2), "%]")
+  ),
+  Estadistico_Prueba = c(
+    paste0("SE = ", round(se_prev, 5)),
+    paste0("Z = ", round(z_dos_prop, 2), " (Chi2 = ", round(unname(prueba_2prop$statistic), 2), ")")
+  ),
+  Valor_p_y_Decision = c(
+    "Estimación por intervalo (Nivel 95%)",
+    "p < 2.2e-16 -> Se rechaza H0"
+  )
+)
+
+kable(
+  tabla_inferencia_1,
+  col.names = c("Procedimiento Inferencial", "Estimación Puntual", "IC 95%", "Estadístico", "Resultado y Decisión"),
+  caption = "Tabla 8. Resultados del Análisis Inferencial 1 (Prevalencia de Phishing y Comparación de Proporciones en HasHiddenFields)."
+)
+
+```
+
+**Interpretación en contexto (Análisis Inferencial 1):**
+
+1. **Prevalencia de Phishing:** Con un nivel de confianza del $95\%$, los límites de $42.51\%$ a $42.91\%$ contienen el valor verdadero de la proporción poblacional de sitios de phishing en el repositorio. La incertidumbre asociada es mínima ($\pm 0.20$ puntos porcentuales), lo que garantiza estabilidad en la estimación de tasas por clase, aunque en la recomendación final deberá considerarse que en el tráfico real de una organización la prevalencia basal de ataques suele ser menor que en un repositorio académico.
+2. **Diferencia de proporciones en `HasHiddenFields`:** Dado que $|Z| = 246.32 > 1.96$ ($p < 2.2 \times 10^{-16} < \alpha = 0.05$), **se rechaza $H_0$**. Con un $95\%$ de confianza, la proporción de sitios de phishing que incluyen campos ocultos es entre $49.46\%$ y $50.09\%$ menor que en los sitios legítimos ($9.30\%$ vs. $59.08\%$). Esto tiene alta relevancia práctica y estadística: los sitios legítimos modernos utilizan etiquetas ocultas (`<input type="hidden">`) de forma intensiva para tokens de seguridad (CSRF) y manejo de sesiones, mientras que las páginas de phishing suelen ser clones estáticos simplificados.
+
+---
+
+## 4.3 Análisis Inferencial 2: Prueba Chi-Cuadrada de Independencia
+
+* **Pregunta:** ¿Existe asociación estadísticamente significativa entre la presencia de un campo de captura de contraseña (`HasPasswordField`) y la clase del sitio (`clase`: Legítimo vs. Phishing), y cuál es su relevancia práctica?
+* **Parámetro e Hipótesis ($\alpha = 0.05$, $gl = (2-1)(2-1) = 1$):**
+* $H_0$: Las variables `HasPasswordField` y `clase` son estadísticamente independientes en la población.
+* $H_1$: Existe dependencia (asociación estadística) entre la presencia de campos de contraseña y la clase del sitio.
+
+
+* **Supuestos:** Muestra aleatoria de observaciones independientes ($n = 235,370$) clasificadas en categorías exhaustivas y mutuamente excluyentes, verificando que todas las frecuencias esperadas cumplan $E_{ij} \ge 5$.
+
+```{r inferencia-2-chicuadrada, echo=TRUE, message=FALSE, warning=FALSE}
+# Tabla de contingencia observada: HasPasswordField vs clase
+tabla_contingencia <- table(
+  Campo_Contrasena = ifelse(datos_limpios$HasPasswordField == 1, "Presente (1)", "Ausente (0)"),
+  Clase_Sitio      = datos_limpios$clase
+)
+
+# Ejecución de la prueba Chi-cuadrada de Pearson (sin corrección de Yates para coincidir con el estadístico exacto)
+prueba_chi2 <- chisq.test(tabla_contingencia, correct = FALSE)
+
+# Verificación de frecuencias esperadas y cálculo de V de Cramér para medir tamaño del efecto
+frec_esperadas <- prueba_chi2$expected
+v_cramer       <- sqrt(unname(prueba_chi2$statistic) / nrow(datos_limpios))
+
+# Construcción de tabla resumen combinando conteos observados y esperados
+tabla_resumen_chi2 <- tibble(
+  Estado_HasPasswordField = rownames(tabla_contingencia),
+  Observados_Legitimo     = format(as.numeric(tabla_contingencia[, "Legitimo"]), big.mark = ","),
+  Esperados_Legitimo      = format(round(frec_esperadas[, "Legitimo"], 2), big.mark = ","),
+  Observados_Phishing     = format(as.numeric(tabla_contingencia[, "Phishing"]), big.mark = ","),
+  Esperados_Phishing      = format(round(frec_esperadas[, "Phishing"], 2), big.mark = ",")
+)
+
+kable(
+  tabla_resumen_chi2,
+  col.names = c("Campo de Contraseña (HasPasswordField)", "Obs. Legítimo", "Esp. Legítimo (H0)", "Obs. Phishing", "Esp. Phishing (H0)"),
+  caption = paste0(
+    "Tabla 9. Tabla de contingencia observada vs. esperada para HasPasswordField y Clase (Chi2 = ",
+    round(unname(prueba_chi2$statistic), 2), ", gl = 1, p < 2.2e-16, V de Cramér = ", round(v_cramer, 4), ")."
+  )
+)
+
+```
+
+**Interpretación en contexto y distinción entre significancia estadística y relevancia práctica (Análisis Inferencial 2):**
+
+* **Verificación de supuestos y decisión estadística:** Todas las celdas presentan frecuencias esperadas superiores a $5$ (la menor es $10,263.83$). Como el estadístico de prueba $\chi^2 = 4,558.17$ supera el valor crítico $\chi^2_{0.05, 1} = 3.8415$ ($p < 2.2 \times 10^{-16} < \alpha = 0.05$), **se rechaza $H_0$**. Existe evidencia estadística de asociación entre la presencia de campos de contraseña y la clase del sitio ($13.85\%$ de presencia en sitios legítimos frente a $5.33\%$ en sitios de phishing).
+* **Significancia estadística vs. relevancia práctica:** Debido al gran tamaño muestral ($n = 235,370$), cualquier desviación moderada respecto a la independencia produce un valor $p$ cercano a cero. Al cuantificar la magnitud real de la asociación mediante la **$V$ de Cramér ($V = 0.1392$)**, se demuestra que la fuerza de asociación individual es **débil**. Operativamente, un sistema de detección no debe bloquear ni descartar un sitio basándose únicamente en si contiene un campo de contraseña, sino evaluarlo en conjunto con las demás variables estructurales y léxicas dentro de los modelos predictivos.
+
+---
+
+## 4.4 Análisis Inferencial 3: Comparación de Medias / ANOVA (Integrante 2)
+
+*(Sección victor)*
+
+```{r inferencia-3-integrante2, echo=TRUE}
+# Código a integrar por el Integrante 2 (Comparación de medias o ANOVA verificando supuestos)
+
+```
+
+# 5. Modelación y Evaluación Preliminar
+
+*(Ambos modelos deben entrenarse sobre `datos_entrenamiento` y evaluarse sobre `datos_prueba`)*
+
+## 5.1 Modelo 1: Regresión Logística Interpretable (Integrante 2)
+
+```{r modelo-logistica-integrante2, echo=TRUE}
+# Código de victor (Ajuste glm binomial en datos_entrenamiento, Odds Ratios con IC 95% y revisión de colinealidad)
+
+```
+
+## 5.2 Modelo 2: Clasificador Flexible y Comparación en Prueba (Integrante 3)
+
+```{r modelo-flexible-integrante3, echo=TRUE}
+# Código a integrar de Ana (Árbol / Random Forest con validación cruzada en datos_entrenamiento y tabla comparativa de métricas en datos_prueba)
+
+```
+
