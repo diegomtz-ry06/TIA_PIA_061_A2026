@@ -1,5 +1,5 @@
 ---
-title: "PIA - TIA - Avance Descriptivo - Versión 1"
+title: "PIA - TIA - Avance Descriptivo - Versión Final"
 subtitle: "Estadística Aplicada a Seguridad en TI"
 author: 
   - " - Diego Francisco Martinez Reyes - [2118638]"
@@ -30,7 +30,7 @@ paquetes <- c("tidyverse", "knitr", "scales", "caret", "rpart", "randomForest", 
 paquetes_faltantes <- paquetes[!(paquetes %in% installed.packages()[, "Package"])]
 if (length(paquetes_faltantes) > 0) {
   options(download.file.method = "libcurl")
-  install.packages(paquetes_faltantes, repos = "[http://cran.rstudio.com/](http://cran.rstudio.com/)")
+  install.packages(paquetes_faltantes, repos = "[https://cloud.r-project.org](https://cloud.r-project.org)")
 }
 
 # Semilla aleatoria 
@@ -331,6 +331,7 @@ knitr::kable(
   row.names = FALSE,
   caption = "Tabla 4. Diccionario completo de las 53 variables resultantes del dataset: datos_limpios"
 )
+# la tabla 1 se renombró a tabla 4
 ```
 ## 2.2 Medidas de Centro y Dispersión
 
@@ -919,7 +920,7 @@ De la **Tabla 12** se analizan tres efectos principales que explican el comporta
    **Explicación práctica:** Aunque intuitivamente se podría pensar que los campos ocultos son maliciosos, en la arquitectura web moderna las aplicaciones legítimas utilizan intensivamente estos atributos para gestionar variables de sesión, pasar tokens anti-CSRF y mantener estados de autenticación. En contraste, las páginas de phishing suelen ser maquetas de suplantación sencillas que solo buscan capturar credenciales mediante formularios estáticos simples.
    
 
-## 5.2 Modelo 2: Clasificador Flexible y Comparación en Prueba 
+## 5.2 Modelo 2: Clasificador Flexible y Comparación en Prueba
 
 ```{r modelo-flexible, echo=TRUE}
 library(caret)
@@ -1019,6 +1020,7 @@ legend(
 )
 
 ```
+
 ### Interpretación de Resultados y Comparación de Modelos
 
 A partir de los resultados presentados en la tabla comparativa y las curvas ROC, se concluye lo siguiente respecto al desempeño del **Modelo 1 (Regresión Logística)** y el **Modelo 2 (Clasificador Flexible / Árbol de Decisión)** evaluados sobre el conjunto de prueba (25% de datos no vistos):
@@ -1030,3 +1032,236 @@ A partir de los resultados presentados en la tabla comparativa y las curvas ROC,
 
 **Conclusión de la validación cruzada:** El uso de validación cruzada (*5-fold CV*) durante el entrenamiento del clasificador flexible garantizó que el parámetro de complejidad (`cp`) elegido no sobreajustara el modelo (*overfitting*), permitiendo que su desempeño se generalizara casi perfectamente al enfrentarse a los nuevos datos del conjunto de prueba.
 
+# 6. Evaluación de Umbrales de Decisión y Costos Operativos
+
+Para traducir el desempeño estadístico de los clasificadores en una decisión de ciberseguridad accionable, se comparan tres umbrales de probabilidad de corte: **0.30** (enfoque preventivo de alta sensibilidad), **0.50** (punto de corte estándar) y **0.70** (enfoque conservador para minimizar bloqueos innecesarios).
+
+## 6.1 Calibración del Umbral sin Contaminar el Conjunto de Prueba
+
+De acuerdo con los criterios de validación, la selección del umbral operativo se realiza **exclusivamente sobre el conjunto de entrenamiento y la validación cruzada (5-Fold CV)**, antes de auditar el impacto final en el conjunto de prueba. Dado que en un entorno SOC un **Falso Negativo** (ataque de phishing omitido que expone credenciales corporativas) conlleva un impacto sustancialmente mayor que un **Falso Positivo** (falsa alarma revisada por un analista), se define una métrica de **Costo Operativo Ponderado** con relación $5:1$:
+
+$$\text{Costo Operativo} = 5 \cdot FN + 1 \cdot FP$$
+
+```{r seleccion-umbral-entrenamiento, echo=TRUE, message=FALSE, warning=FALSE}
+# Función auxiliar para calcular todas las métricas obligatorias dado un umbral
+evaluar_umbral <- function(probs, reales_bin, umbral, nombre_modelo, costo_fn = 5, costo_fp = 1) {
+  pred_bin <- ifelse(probs >= umbral, 1L, 0L)
+  
+  VP <- sum(pred_bin == 1L & reales_bin == 1L)
+  FN <- sum(pred_bin == 0L & reales_bin == 1L)
+  FP <- sum(pred_bin == 1L & reales_bin == 0L)
+  VN <- sum(pred_bin == 0L & reales_bin == 0L)
+  
+  sensibilidad  <- VP / (VP + FN)
+  especificidad <- VN / (VN + FP)
+  precision     <- ifelse((VP + FP) > 0, VP / (VP + FP), NA_real_)
+  f1_score      <- ifelse((precision + sensibilidad) > 0,
+                          2 * precision * sensibilidad / (precision + sensibilidad), NA_real_)
+  tasa_falsas_alarmas <- FP / (FP + VN) # FPR = 1 - Especificidad
+  costo_total   <- costo_fn * FN + costo_fp * FP
+  
+  tibble(
+    Modelo = nombre_modelo,
+    Umbral = sprintf("%.2f", umbral),
+    VP = VP,
+    FN = FN,
+    FP = FP,
+    VN = VN,
+    Sensibilidad = round(sensibilidad, 4),
+    Especificidad = round(especificidad, 4),
+    Precision = round(precision, 4),
+    F1 = round(f1_score, 4),
+    Tasa_Falsas_Alarmas = round(tasa_falsas_alarmas, 4),
+    Costo_5a1 = costo_total
+  )
+}
+
+umbrales_eval <- c(0.30, 0.50, 0.70)
+
+# 1. Probabilidades en Entrenamiento (Modelo 1: Regresión Logística)
+prob_train_m1 <- predict(modelo_logistico, newdata = datos_entrenamiento, type = "response")
+reales_train_m1 <- datos_entrenamiento$phishing_num
+
+# 2. Probabilidades fuera de pliegue en 5-Fold CV (Modelo 2: Árbol de Decisión)
+pred_cv_m2 <- modelo_flexible$pred %>%
+  filter(cp == modelo_flexible$bestTune$cp)
+reales_cv_m2 <- ifelse(pred_cv_m2$obs == "Phishing", 1L, 0L)
+
+tabla_umbrales_train <- bind_rows(
+  map_dfr(umbrales_eval, ~ evaluar_umbral(prob_train_m1, reales_train_m1, .x, "M1: Regresión Logística (Train)")),
+  map_dfr(umbrales_eval, ~ evaluar_umbral(pred_cv_m2$Phishing, reales_cv_m2, .x, "M2: Árbol de Decisión (5-Fold CV)"))
+)
+
+kable(
+  tabla_umbrales_train %>%
+    select(Modelo, Umbral, FN, FP, Sensibilidad, Especificidad, Precision, Tasa_Falsas_Alarmas, Costo_5a1),
+  col.names = c("Modelo (Validación Interna)", "Umbral", "FN (Omitidos)", "FP (Falsas Alarmas)",
+                "Sensibilidad", "Especificidad", "Precisión", "Tasa Falsas Alarmas", "Costo (5·FN + FP)"),
+  caption = "Tabla 14. Selección de umbral en Entrenamiento y Validación Cruzada (sin utilizar datos de prueba)."
+)
+
+```
+
+**Decisión de umbral a partir de validación interna:**
+En la validación cruzada interna (Tabla 14), el **Modelo 2 (Árbol de Decisión)** supera de forma consistente a la Regresión Logística en todos los umbrales. Bajo un criterio de costo $5:1$ (priorizando evitar ataques omitidos), el umbral **0.30** logra el menor costo operativo y la mayor sensibilidad, mientras que **0.50** ofrece el equilibrio más limpio con una tasa de falsas alarmas inferior al $0.4\%$. A continuación se auditan formalmente estos tres umbrales en el conjunto de prueba reservado ($25\%$).
+
+---
+
+## 6.2 Evaluación Fuera de Muestra en el Conjunto de Prueba (25%)
+
+```{r evaluacion-umbrales-prueba, echo=TRUE, message=FALSE, warning=FALSE}
+# Vector binario real en el conjunto de prueba (1 = Phishing, 0 = Legítimo)
+reales_prueba <- datos_prueba$phishing_num
+
+# Evaluación completa de los 3 umbrales para ambos modelos en prueba
+tabla_umbrales_prueba <- bind_rows(
+  map_dfr(umbrales_eval, ~ evaluar_umbral(prob_mod1, reales_prueba, .x, "Modelo 1: Regresión Logística")),
+  map_dfr(umbrales_eval, ~ evaluar_umbral(prob_mod2, reales_prueba, .x, "Modelo 2: Árbol de Decisión"))
+) %>%
+  mutate(
+    ROC_AUC = ifelse(grepl("Modelo 1", Modelo), round(auc_mod1, 4), round(auc_mod2, 4))
+  )
+
+kable(
+  tabla_umbrales_prueba %>%
+    select(Modelo, Umbral, VP, FN, FP, VN, Sensibilidad, Especificidad, Precision, F1, Tasa_Falsas_Alarmas, ROC_AUC),
+  col.names = c("Modelo", "Umbral", "VP", "FN", "FP", "VN",
+                "Sensibilidad", "Especificidad", "Precisión", "F1", "Tasa Falsas Alarmas", "ROC-AUC"),
+  caption = "Tabla 15. Evaluación integral de métricas obligatorias y errores esperados por umbral en el conjunto de prueba (n = 58,842)."
+)
+
+```
+
+```{r grafica-compromiso-umbrales, echo=TRUE, message=FALSE, warning=FALSE, fig.width=9, fig.height=4.8}
+# Figura 7: Comparación visual de Falsos Negativos vs. Falsos Positivos por umbral y modelo
+datos_plot_errores <- tabla_umbrales_prueba %>%
+  select(Modelo, Umbral, `Falsos Negativos (Ataques Omitidos)` = FN,
+         `Falsos Positivos (Falsas Alarmas)` = FP) %>%
+  pivot_longer(
+    cols = c(`Falsos Negativos (Ataques Omitidos)`, `Falsos Positivos (Falsas Alarmas)`),
+    names_to = "Tipo_Error",
+    values_to = "Cantidad"
+  )
+
+ggplot(datos_plot_errores, aes(x = Umbral, y = Cantidad, fill = Tipo_Error)) +
+  geom_col(position = "dodge", width = 0.65, alpha = 0.88) +
+  geom_text(
+    aes(label = format(Cantidad, big.mark = ",")),
+    position = position_dodge(width = 0.65),
+    vjust = -0.35,
+    size = 3.2,
+    fontface = "bold"
+  ) +
+  facet_wrap(~ Modelo, scales = "free_y") +
+  scale_fill_manual(values = c(
+    "Falsos Negativos (Ataques Omitidos)" = "#c0392b",
+    "Falsos Positivos (Falsas Alarmas)"   = "#f39c12"
+  )) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.16))) +
+  labs(
+    title = "Figura 7. Compromiso operativo entre Falsos Negativos y Falsos Positivos por Umbral",
+    subtitle = "Evaluación fuera de muestra en el conjunto de prueba (n = 58,842 URLs)",
+    x = "Umbral de Probabilidad de Decisión",
+    y = "Número de URLs Mal Clasificadas",
+    fill = "Tipo de Error Operativo"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold", size = 10.5)
+  )
+
+```
+
+---
+
+## 6.3 Matrices de Confusión Detalladas
+
+Para visualizar exactamente los aciertos y errores que enfrentaría el equipo de seguridad con la configuración seleccionada, se presentan las matrices de confusión del **Modelo 2 (Árbol de Decisión)** en el umbral preventivo (`0.30`) y en el umbral balanceado (`0.50`), junto con su equivalente proyectado por cada **10,000 URLs** analizadas.
+
+```{r matrices-confusion-operativas, echo=TRUE, message=FALSE, warning=FALSE}
+# Extracción de filas del Modelo 2 para los umbrales 0.30 y 0.50
+res_m2_030 <- tabla_umbrales_prueba %>% filter(grepl("Modelo 2", Modelo), Umbral == "0.30")
+res_m2_050 <- tabla_umbrales_prueba %>% filter(grepl("Modelo 2", Modelo), Umbral == "0.50")
+
+n_prueba <- nrow(datos_prueba)
+
+tabla_impacto_operativo <- tibble(
+  Escenario = c(
+    "Modelo 2 (Árbol) - Umbral 0.30 (Preventivo / Alta Sensibilidad)",
+    "Modelo 2 (Árbol) - Umbral 0.50 (Estándar / Balanceado)"
+  ),
+  Matriz_VP_FN_FP_VN <- c(
+  paste0(
+    "VP=", format(res_m2_030$VP, big.mark=","),
+    "<br>FN=", res_m2_030$FN,
+    " | FP=", res_m2_030$FP,
+    "<br>VN=", format(res_m2_030$VN, big.mark=",")
+  ),
+  paste0(
+    "VP=", format(res_m2_050$VP, big.mark=","),
+    "<br>FN=", res_m2_050$FN,
+    " | FP=", res_m2_050$FP,
+    "<br>VN=", format(res_m2_050$VN, big.mark=",")
+  )
+
+  ),
+  FN_por_10k = c(
+    round(res_m2_030$FN / n_prueba * 10000, 1),
+    round(res_m2_050$FN / n_prueba * 10000, 1)
+  ),
+  FP_por_10k = c(
+    round(res_m2_030$FP / n_prueba * 10000, 1),
+    round(res_m2_050$FP / n_prueba * 10000, 1)
+  ),
+  Costo_Operativo_Prueba = c(res_m2_030$Costo_5a1, res_m2_050$Costo_5a1)
+)
+
+kable(
+  tabla_impacto_operativo,
+  col.names = c("Configuración Evaluada", "Matriz de Confusión en Prueba (n = 58,842)",
+                "Ataques Omitidos (FN / 10k URLs)", "Falsas Alarmas (FP / 10k URLs)",
+                "Costo Ponderado (5·FN + FP)"),
+  caption = "Tabla 16. Traducción operativa de las matrices de confusión del Modelo 2 en el conjunto de prueba."
+)
+
+```
+
+---
+
+## 6.4 Justificación Operativa del Modelo y Umbral Recomendados
+
+1. **Modelo recomendado — Modelo 2 (Árbol de Decisión con `cp = 0.0005`):** Aunque la Regresión Logística (Modelo 1) aporta una interpretabilidad directa mediante razones de momios ($\text{ROC-AUC} = 0.9944$), su supuesto lineal genera más de $1,100$ falsos positivos y más de $600$ ataques omitidos en el conjunto de prueba al umbral $0.50$. El Árbol de Decisión captura interacciones no lineales entre atributos léxicos y estructurales del HTML, elevando el $\text{ROC-AUC}$ a $0.9980$ y reduciendo drásticamente tanto los falsos negativos como las falsas alarmas.
+2. **Selección de umbral según el perfil de riesgo organizacional:**
+* **Escenario recomendado (Bloqueo / Cuarentena en SOC — Umbral `0.30`):** Al bajar el corte de `0.50` a `0.30`, se reduce el número de ataques de phishing omitidos (**Falsos Negativos**) a costa de un incremento acotado en las falsas alarmas (**Falsos Positivos**). En un entorno corporativo donde un solo robo de credenciales puede derivar en compromiso de correo empresarial (BEC) o movimiento lateral, **es operativamente preferible asumir la revisión de unos pocos tickets adicionales de *whitelisting* que dejar pasar ataques reales**.
+* **Alternativa de baja fricción (Umbral `0.50`):** Si el sistema se despliega como bloqueo automático estricto sin un equipo SOC de nivel 1 que atienda desbloqueos rápidos, el umbral `0.50` ofrece una especificidad superior al $99.6\%$ (tasa de falsas alarmas menor al $0.4\%$), minimizando la interrupción a los usuarios finales.
+* **Por qué se descarta el umbral `0.70`:** Elevar el umbral a `0.70` incrementa innecesariamente los ataques omitidos (FN) con una ganancia marginal mínima en especificidad, lo cual resulta inaceptable desde la perspectiva de gestión de riesgos.
+
+
+3. **Estrategia de despliegue en capas:** Para mitigar la diferencia entre la prevalencia del dataset ($42.71\%$) y la prevalencia real en tráfico corporativo ($< 1\%$), se recomienda operar el **Modelo 2** con un esquema de dos niveles: **alerta/cuarentena preventiva** para URLs con probabilidad entre `0.30` y `0.50` (bandera de advertencia al usuario o análisis en *sandbox*), y **bloqueo automático inmediato** para URLs con probabilidad $\ge 0.50$.
+
+# 7. Conclusiones, Limitaciones y Riesgos de Generalización
+
+## 7.1 Respuesta a la Pregunta Rectora
+
+Con base en los análisis estadísticos y los modelos entrenados sobre las $235,370$ URLs únicas del dataset *PhiUSIIL Phishing URL*, concluimos que **sí es posible distinguir de forma precisa y comprensible entre páginas legítimas y sitios de phishing** combinando características de la dirección web (URL) y la estructura del código HTML, incluso después de eliminar las variables que causaban fuga de información (*data leakage*).
+
+- **Lo que muestran los datos (Evidencia Inferencial):** Las pruebas estadísticas confirmaron diferencias muy claras ($p < 2.2 \times 10^{-16}$) entre ambos tipos de páginas. Las URLs de phishing son notablemente más largas (prueba $t$ de Welch) y tienen una proporción mucho mayor de caracteres especiales (`SpacialCharRatioInURL`). Por otro lado, los sitios legítimos tienen una construcción web mucho más completa (mediana de $1,105$ líneas de código frente a apenas $12$ en phishing) y usan con mucha más frecuencia campos ocultos de control (`HasHiddenFields`: $59.08\%$ vs. $9.30\%$). También comprobamos que señales aisladas, como tener un campo de contraseña (`HasPasswordField`), tienen una relación débil por sí solas, por lo que es indispensable evaluar varias características en conjunto.
+- **El desempeño de los modelos (Evidencia Predictiva):** Al evaluar nuestros modelos con el $25\%$ de datos reservados para prueba ($n = 58,842$), tanto el **Modelo 1 (Regresión Logística)** como el **Modelo 2 (Árbol de Decisión ajustado con validación cruzada 5-Fold)** lograron un área bajo la curva $\text{ROC-AUC} > 0.99$, manteniendo un muy buen equilibrio entre detectar ataques reales (**Sensibilidad**) y no bloquear páginas seguras (**Especificidad**). En particular, contar con enlaces a redes sociales (`HasSocialNet`) y campos ocultos de sesión reduce considerablemente la probabilidad de que el sitio sea malicioso ($\text{OR} < 1$), mientras que el exceso de caracteres especiales en la URL dispara el riesgo ($\text{OR} > 1$). Finalmente, el **Modelo 2 ($\text{AUC} = 0.9980$)** resultó ser la mejor opción operativa al reducir los errores respecto a la regresión logística, recomendándose el **umbral `0.30`** para minimizar ataques omitidos en un entorno SOC (o `0.50` para bloqueo automático con mínima fricción).
+
+---
+
+## 7.2 Limitaciones del Estudio
+
+1. **Sesgo en la recolección de las URLs:** Como vimos en la auditoría inicial (Tabla 3), los sitios legítimos del dataset fueron tomados casi siempre desde su página principal o dominio raíz (por ejemplo, `https://www.ejemplo.com`), mientras que los de phishing incluyen rutas internas completas con parámetros (`?`, `=`, `&`). Esto nos obligó a descartar variables como `URLSimilarityIndex` o `IsHTTPS` porque tenían varianza cero en los sitios seguros y habrían hecho que los modelos hicieran "trampa" al clasificar.
+2. **Análisis estático (una foto fija):** El estudio evalúa únicamente el texto de la URL y el código HTML descargado en un momento dado. No incluye información dinámica en tiempo real, como la antigüedad del dominio (registros WHOIS), la validez de certificados SSL/TLS, listas negras de direcciones IP ni el comportamiento de ejecución de *scripts*.
+3. **Necesidad de descargar el código de la página:** Varias de las señales más útiles para nuestros modelos (como `HasSocialNet`, `LineOfCode` o `HasHiddenFields`) requieren leer el contenido HTML del sitio. En filtros de red o DNS que deben bloquear el acceso antes de que se establezca la conexión, estos datos no estarían disponibles al instante.
+4. **Relación de costos fija ($5:1$):** La selección del umbral recomendado (`0.30`) asume que un ataque omitido cuesta $5$ veces más que una falsa alarma; en empresas sin personal para revisar alertas en cuarentena, este peso tendría que ajustarse.
+
+---
+
+## 7.3 Riesgos de Generalización y Uso en la Vida Real
+
+1. **Diferencia entre la proporción del dataset y el tráfico real:** En nuestra base de datos, el $42.71\%$ de los enlaces son phishing ($\text{IC } 95\%: [42.51\%, 42.91\%]$). Sin embargo, en el día a día de una empresa, los ataques representan menos del $1\%$ del tráfico total. Si se implementa el modelo con un corte único en $p \ge 0.50$, podría generar demasiadas falsas alarmas, por lo que en producción conviene aplicar el esquema en dos niveles propuesto en la Sección 6.4 (alerta/cuarentena entre `0.30` y `0.50`, y bloqueo automático en $\ge 0.50$).
+2. **Adaptación de los atacantes:** Las técnicas de phishing cambian constantemente. Si los atacantes comienzan a clonar de forma exacta todo el código HTML de páginas legítimas (incluyendo enlaces funcionales a redes sociales, avisos legales y campos ocultos), las reglas actuales perderán efectividad con el tiempo, haciendo necesario reentrenar los modelos periódicamente.
+3. **Falsos positivos en páginas legítimas sencillas o con enlaces complejos:** Algunas páginas web reales muy minimalistas (como aplicaciones de una sola página) o enlaces legítimos de inicio de sesión con muchos parámetros especiales (como redirecciones OAuth) pueden parecerse estructuralmente a una plantilla de phishing, corriendo el riesgo de ser bloqueadas por error.
